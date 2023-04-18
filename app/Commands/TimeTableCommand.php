@@ -11,6 +11,8 @@ use Exception;
 use InvalidArgumentException;
 use LaravelZero\Framework\Commands\Command;
 use PhpOffice\PhpSpreadsheet\IOFactory;
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 use Throwable;
 
 class TimeTableCommand extends Command
@@ -41,8 +43,6 @@ class TimeTableCommand extends Command
         'Lucreaza de noaptea' => 'working_on_night',
         'Lucreaza in weekend' => 'working_on_weekend',
     ];
-
-    private array $x = [];
 
     /**
      * @throws Exception
@@ -118,8 +118,17 @@ class TimeTableCommand extends Command
         $this->addAllNights($employers, $timeTable, $favoriteScheduleTimes);
         $this->addExtraNights($employers, $timeTable, $favoriteScheduleTimes);
         $this->addAllWeekendsTurns($employers, $timeTable, $favoriteScheduleTimes);
-        ksort($timeTable);
-        dump($timeTable);
+        $this->addPublicHolidaysTurns($employers, $timeTable, $favoriteScheduleTimes);
+        $this->addFreeDaysForEveryEmployers($employers, $timeTable);
+        $this->addMinimumMornings($employers, $timeTable);
+        $this->addMinimumAfternoons($employers, $timeTable);
+        $this->addMorningsAndAfternoonsForSpecificEmployers($employers, $timeTable);
+        $this->addAllMinimumMornings($employers, $timeTable);
+        $this->addAllMinimumAfternoons($employers, $timeTable);
+        $this->addAllMaximumMornings($employers, $timeTable);
+        $this->addAllMaximumAfternoons($employers, $timeTable);
+
+        $this->saveTimeTable($employers, $timeTable);
     }
 
     /**
@@ -137,7 +146,7 @@ class TimeTableCommand extends Command
         $formattedEmployers = [];
         $priorityEmployer = [];
 
-        foreach ($employers as $employer) {
+        foreach ($employers as $key => $employer) {
             $formattedEmployer = [];
 
             foreach ($employer as $index => $value) {
@@ -151,6 +160,8 @@ class TimeTableCommand extends Command
             if (TimeTableRule2023::WORKING_ON_WEEKENDS[($formattedEmployer['working_on_weekend'] ?? 'DA')]) {
                 $this->noOfWorkingPersonsOnWeekends++;
             }
+
+            $formattedEmployer['order_index'] = $key;
 
             if (($formattedEmployer['name'] ?? '') === TimeTableRule2023::PRIORITY_EMPLOYER) {
                 $priorityEmployer = $formattedEmployer;
@@ -278,6 +289,11 @@ class TimeTableCommand extends Command
         return $this->filePath;
     }
 
+    private function getOutputFilePath(): string
+    {
+        return storage_path('app') . '/timetable-output.xlsx';
+    }
+
     private function getPreference(array &$favoriteScheduleTimes, array $employer, string $date): ?string
     {
         $preferences = $this->getPreferencesForSpecificDate(
@@ -345,11 +361,16 @@ class TimeTableCommand extends Command
             return;
         }
 
-        $timeTable[$date][$employer['name']] = $preference;
+        if (!isset($timeTable[$date][$employer['name']])) {
+            $timeTable[$date][$employer['name']] = $preference;
+        }
 
         if ($preference === TimeTableRule2023::WORKING_ON_THE_NIGHT) {
-            $timeTable[$startDate->copy()->addDay()->format('Y-m-d')][$employer['name']]
-                = TimeTableRule2023::FREE_DAY_AFTER_NIGHT_TURN;
+            $nextDay = $startDate->copy()->addDay()->format('Y-m-d');
+
+            if (!isset($timeTable[$nextDay][$employer['name']])) {
+                $timeTable[$nextDay][$employer['name']] = TimeTableRule2023::FREE_DAY_AFTER_NIGHT_TURN;
+            }
         }
     }
 
@@ -365,7 +386,12 @@ class TimeTableCommand extends Command
             !$startDate->isWeekend()
             && !$startDate->isFriday()
             && !in_array($date, TimeTableRule2023::$publicHolidays, true)
-            && !$this->hasMaximumNightsTurns($timeTable, $employerName)
+            && !$this->hasMaximumTurns(
+                $timeTable,
+                $employerName,
+                TimeTableRule2023::WORKING_ON_THE_NIGHT,
+                TimeTableRule2023::MAX_NO_OF_NIGHTS
+            )
             && $this->canHaveNightTurn(
                 $timeTable,
                 $date,
@@ -404,7 +430,12 @@ class TimeTableCommand extends Command
                 || $startDate->isFriday()
                 || in_array($date, TimeTableRule2023::$publicHolidays, true)
             )
-            && !$this->hasMaximumNightsTurns($timeTable, $employer['name'])
+            && !$this->hasMaximumTurns(
+                $timeTable,
+                $employer['name'],
+                TimeTableRule2023::WORKING_ON_THE_NIGHT,
+                TimeTableRule2023::MAX_NO_OF_NIGHTS,
+            )
             && $this->canHaveNightTurn(
                 $timeTable,
                 $date,
@@ -469,9 +500,13 @@ class TimeTableCommand extends Command
         return $noOfTurns < $maximumTurns;
     }
 
-    private function hasMaximumNightsTurns(array $timeTable, string $employerName): bool
-    {
-        $noOfTurns = 0;
+    private function hasMaximumTurns(
+        array $timeTable,
+        string $employerName,
+        string $employerOption,
+        int $noOfTurns
+    ): bool {
+        $totalTurns = 0;
 
         foreach ($timeTable as $employer) {
             foreach ($employer as $name => $option) {
@@ -479,13 +514,13 @@ class TimeTableCommand extends Command
                     continue;
                 }
 
-                if ($option === TimeTableRule2023::WORKING_ON_THE_NIGHT) {
-                    $noOfTurns++;
+                if ($option === $employerOption) {
+                    $totalTurns++;
                 }
             }
         }
 
-        return $noOfTurns >= TimeTableRule2023::MAX_NO_OF_NIGHTS;
+        return $totalTurns >= $noOfTurns;
     }
 
     private function hasPreferences(array $employer, ?string $preference): bool
@@ -719,10 +754,6 @@ class TimeTableCommand extends Command
             }
         }
 
-        if (!isset($this->x[$employerName]) || $this->x[$employerName] < $noOfTurns) {
-            $this->x[$employerName] = $noOfTurns;
-        }
-
         return $noOfTurns >= ($noOfWorkingHours / TimeTableRule2023::MAX_NO_OF_DAILY_WORKING_HOURS);
     }
 
@@ -745,6 +776,17 @@ class TimeTableCommand extends Command
         return $dates;
     }
 
+    private function getTurnOptionsForSpecificDate(array $timeTable, string $date): array
+    {
+        $options = [];
+
+        foreach ($timeTable[$date] ?? [] as $option) {
+            $options[] = $option;
+        }
+
+        return $options;
+    }
+
     private function addAllWeekendsTurns(array $employers, array &$timeTable, array $favoriteScheduleTimes): void
     {
         $this->addWeekendsTurns(
@@ -765,5 +807,572 @@ class TimeTableCommand extends Command
             $favoriteScheduleTimes,
             TimeTableRule2023::MAX_NO_OF_WEEKEND_WORKING_HOURS
         );
+    }
+
+    private function addPublicHolidaysTurns(array $employers, array &$timeTable, array $favoriteScheduleTimes): void
+    {
+        [$startDate, $endDate] = $this->getDateInterval();
+
+        while ($startDate <= $endDate) {
+            foreach ($employers as $employer) {
+                $date = $startDate->format('Y-m-d');
+
+                if (!in_array($date, TimeTableRule2023::$publicHolidays, true)) {
+                    continue;
+                }
+
+                if (isset($timeTable[$date][$employer['name']])) {
+                    continue;
+                }
+
+                $preference = $favoriteScheduleTimes[$date][$employer['name']]['preferences'] ?? null;
+
+                if ($this->hasPreferences($employer, $preference)) {
+                    continue;
+                }
+
+                if (
+                    !in_array(
+                        TimeTableRule2023::WORKING_ON_THE_MORNING,
+                        $this->getTurnOptionsForSpecificDate($timeTable, $date),
+                        true
+                    )
+                ) {
+                    $timeTable[$date][$employer['name']] = TimeTableRule2023::WORKING_ON_THE_MORNING;
+                }
+
+                if (
+                    !in_array(
+                        TimeTableRule2023::WORKING_ON_THE_AFTERNOON,
+                        $this->getTurnOptionsForSpecificDate($timeTable, $date),
+                        true
+                    )
+                ) {
+                    $timeTable[$date][$employer['name']] = TimeTableRule2023::WORKING_ON_THE_AFTERNOON;
+                }
+            }
+
+            $startDate->addDay();
+        }
+    }
+
+    private function getNoOfFreeDaysForEveryEmployers(array $timeTable): array
+    {
+        $employerDayNumbers = [];
+
+        foreach ($timeTable as $date => $employer) {
+            foreach ($employer as $name => $option) {
+                if (!isset($employerDayNumbers[$name])) {
+                    $employerDayNumbers[$name] = 0;
+                }
+
+                $dateObject = Carbon::parse($date);
+
+                if (
+                    in_array($date, TimeTableRule2023::$publicHolidays, true)
+                    && !$dateObject->isWeekend()
+                    && !$dateObject->isFriday()
+                    && in_array(
+                        $option,
+                        [
+                            TimeTableRule2023::WORKING_ON_THE_MORNING,
+                            TimeTableRule2023::WORKING_ON_THE_AFTERNOON,
+                            TimeTableRule2023::WORKING_ON_THE_NIGHT
+                        ],
+                        true
+                    )
+                ) {
+                    $employerDayNumbers[$name]++;
+                    continue;
+                }
+
+                if (
+                    in_array($date, TimeTableRule2023::$publicHolidays, true)
+                    && $dateObject->isFriday()
+                    && in_array(
+                        $option,
+                        [
+                            TimeTableRule2023::WORKING_ON_THE_MORNING,
+                            TimeTableRule2023::WORKING_ON_THE_AFTERNOON,
+                        ],
+                        true
+                    )
+                ) {
+                    $employerDayNumbers[$name]++;
+                    continue;
+                }
+
+                if (
+                    in_array($date, TimeTableRule2023::$publicHolidays, true)
+                    && $dateObject->isFriday()
+                    && $option === TimeTableRule2023::WORKING_ON_THE_NIGHT
+                ) {
+                    $employerDayNumbers[$name] += 2;
+                    continue;
+                }
+
+                if (
+                    in_array($date, TimeTableRule2023::$publicHolidays, true)
+                    && $dateObject->isWeekend()
+                    && in_array(
+                        $option,
+                        [
+                            TimeTableRule2023::WORKING_ON_THE_MORNING,
+                            TimeTableRule2023::WORKING_ON_THE_AFTERNOON,
+                            TimeTableRule2023::WORKING_ON_THE_NIGHT
+                        ],
+                        true
+                    )
+                ) {
+                    $employerDayNumbers[$name] += 2;
+                    continue;
+                }
+
+                if (
+                    !in_array($date, TimeTableRule2023::$publicHolidays, true)
+                    && ($dateObject->isFriday() || $dateObject->isSunday())
+                    && $option === TimeTableRule2023::WORKING_ON_THE_NIGHT
+                ) {
+                    $employerDayNumbers[$name]++;
+                    continue;
+                }
+
+                if (
+                    !in_array($date, TimeTableRule2023::$publicHolidays, true)
+                    && $dateObject->isWeekend()
+                    && in_array(
+                        $option,
+                        [
+                            TimeTableRule2023::WORKING_ON_THE_MORNING,
+                            TimeTableRule2023::WORKING_ON_THE_AFTERNOON,
+                        ],
+                        true
+                    )
+                ) {
+                    $employerDayNumbers[$name]++;
+                    continue;
+                }
+
+                if (
+                    !in_array($date, TimeTableRule2023::$publicHolidays, true)
+                    && $dateObject->isSaturday()
+                    && $option === TimeTableRule2023::WORKING_ON_THE_NIGHT
+                ) {
+                    $employerDayNumbers[$name] += 2;
+                }
+            }
+        }
+
+        return $employerDayNumbers;
+    }
+
+    private function addFreeDaysForEveryEmployers(array $employers, array &$timeTable): void
+    {
+        [$startDate, $endDate] = $this->getDateInterval();
+        $employersFreeDays = $this->getNoOfFreeDaysForEveryEmployers($timeTable);
+
+        while ($startDate <= $endDate) {
+            foreach ($employers as $employer) {
+                $date = $startDate->format('Y-m-d');
+
+                if (isset($timeTable[$date][$employer['name']])) {
+                    continue;
+                }
+
+                if ($startDate->isWeekend()) {
+                    continue;
+                }
+
+                $noOfFreeDays = array_count_values(array_values($timeTable[$date]))[TimeTableRule2023::FREE_DAY] ?? 0;
+
+                if (($employersFreeDays[$employer['name']] ?? 0) && $noOfFreeDays < 2) {
+                    $timeTable[$date][$employer['name']] = TimeTableRule2023::FREE_DAY;
+                    $employersFreeDays[$employer['name']]--;
+                }
+            }
+
+            $startDate->addDay();
+        }
+    }
+
+    private function getNumberOfWorkingHoursForSpecificWeek(array $timeTable, Carbon $date, string $employerName): int
+    {
+        $startOfWeek = $date->clone()->startOfWeek(1);
+
+        if ($startOfWeek->month < $date->month) {
+            $startOfWeek = $date;
+        }
+
+        $endOfWeek = $date->clone()->startOfWeek(0)->addWeek();
+        $noOfHours = 0;
+
+        foreach ($timeTable as $date => $employers) {
+            $dateObject = Carbon::parse($date);
+
+            if (
+                $dateObject->getTimestamp() < $startOfWeek->getTimestamp()
+                || $dateObject->getTimestamp() > $endOfWeek->getTimestamp()
+            ) {
+                continue;
+            }
+
+            foreach ($employers as $name => $option) {
+                if ($name !== $employerName) {
+                    continue;
+                }
+
+                $noOfHours += TimeTableHelper::mapEmployersHours()[$option] ?? 0;
+            }
+        }
+
+        return $noOfHours;
+    }
+
+    private function addMinimumMornings(array $employers, array &$timeTable): void
+    {
+        [$startDate, $endDate] = $this->getDateInterval();
+
+        while ($startDate <= $endDate) {
+            foreach ($employers as $employer) {
+                $date = $startDate->format('Y-m-d');
+
+                if (isset($timeTable[$date][$employer['name']])) {
+                    continue;
+                }
+
+                if (strtoupper($employer['working_on_weekend'] ?? 'DA') !== 'DA') {
+                    continue;
+                }
+
+                if ($startDate->isWeekend() || in_array($date, TimeTableRule2023::$publicHolidays, true)) {
+                    continue;
+                }
+
+                $noOfMornings = array_count_values(
+                    array_values($timeTable[$date])
+                )[TimeTableRule2023::WORKING_ON_THE_MORNING] ?? 0;
+
+                if ($noOfMornings >= TimeTableRule2023::MIN_NO_OF_PERSONS_FOR_MORNING_TURN) {
+                    continue;
+                }
+
+                if (
+                    $this->getNumberOfWorkingHoursForSpecificWeek($timeTable, $startDate, $employer['name'])
+                    >= TimeTableRule2023::MAX_NO_OF_WEEKLY_WORKING_HOURS
+                ) {
+                    continue;
+                }
+
+                if (
+                    !$this->hasMaximumTurns(
+                        $timeTable,
+                        $employer['name'],
+                        TimeTableRule2023::WORKING_ON_THE_MORNING,
+                        TimeTableRule2023::MIN_NO_OF_MORNINGS,
+                    )
+                ) {
+                    $timeTable[$date][$employer['name']] = TimeTableRule2023::WORKING_ON_THE_MORNING;
+                }
+            }
+
+            $startDate->addDay();
+        }
+    }
+
+    private function addMinimumAfternoons(array $employers, array &$timeTable): void
+    {
+        [$startDate, $endDate] = $this->getDateInterval();
+
+        while ($startDate <= $endDate) {
+            foreach ($employers as $employer) {
+                $date = $startDate->format('Y-m-d');
+
+                if (isset($timeTable[$date][$employer['name']])) {
+                    continue;
+                }
+
+                if (strtoupper($employer['working_on_weekend'] ?? 'DA') !== 'DA') {
+                    continue;
+                }
+
+                if ($startDate->isWeekend() || in_array($date, TimeTableRule2023::$publicHolidays, true)) {
+                    continue;
+                }
+
+                $noOfAfternoons = array_count_values(
+                    array_values($timeTable[$date])
+                )[TimeTableRule2023::WORKING_ON_THE_AFTERNOON] ?? 0;
+
+                if ($noOfAfternoons >= TimeTableRule2023::MIN_NO_OF_PERSONS_FOR_AFTERNOON_TURN) {
+                    continue;
+                }
+
+                if (
+                    $this->getNumberOfWorkingHoursForSpecificWeek($timeTable, $startDate, $employer['name'])
+                    >= TimeTableRule2023::MAX_NO_OF_WEEKLY_WORKING_HOURS
+                ) {
+                    continue;
+                }
+
+                if (
+                    !$this->hasMaximumTurns(
+                        $timeTable,
+                        $employer['name'],
+                        TimeTableRule2023::WORKING_ON_THE_AFTERNOON,
+                        TimeTableRule2023::MIN_NO_OF_AFTERNOONS,
+                    )
+                ) {
+                    $timeTable[$date][$employer['name']] = TimeTableRule2023::WORKING_ON_THE_AFTERNOON;
+                }
+            }
+
+            $startDate->addDay();
+        }
+    }
+
+    private function addMorningsAndAfternoonsForSpecificEmployers(array $employers, array &$timeTable): void
+    {
+        [$startDate, $endDate] = $this->getDateInterval();
+
+        while ($startDate <= $endDate) {
+            foreach ($employers as $employer) {
+                $date = $startDate->format('Y-m-d');
+
+                if (isset($timeTable[$date][$employer['name']])) {
+                    continue;
+                }
+
+                if ($startDate->isWeekend() || in_array($date, TimeTableRule2023::$publicHolidays, true)) {
+                    continue;
+                }
+
+                if (strtoupper($employer['working_on_weekend'] ?? 'DA') === 'DA') {
+                    continue;
+                }
+
+                $options = [
+                    TimeTableRule2023::WORKING_ON_THE_MORNING,
+                    TimeTableRule2023::WORKING_ON_THE_AFTERNOON
+                ];
+
+                $timeTable[$date][$employer['name']] = $options[array_rand($options)];
+            }
+
+            $startDate->addDay();
+        }
+    }
+
+    private function addAllMinimumMornings(array $employers, array &$timeTable): void
+    {
+        [$startDate, $endDate] = $this->getDateInterval();
+
+        while ($startDate <= $endDate) {
+            foreach ($employers as $employer) {
+                $date = $startDate->format('Y-m-d');
+
+                if (isset($timeTable[$date][$employer['name']])) {
+                    continue;
+                }
+
+                if ($startDate->isWeekend() || in_array($date, TimeTableRule2023::$publicHolidays, true)) {
+                    continue;
+                }
+
+                $noOfMornings = array_count_values(
+                    array_values($timeTable[$date])
+                )[TimeTableRule2023::WORKING_ON_THE_MORNING] ?? 0;
+
+                if ($noOfMornings >= TimeTableRule2023::MIN_NO_OF_PERSONS_FOR_MORNING_TURN) {
+                    continue;
+                }
+
+                if (
+                    $this->getNumberOfWorkingHoursForSpecificWeek($timeTable, $startDate, $employer['name'])
+                    >= TimeTableRule2023::MAX_NO_OF_WEEKLY_WORKING_HOURS
+                ) {
+                    continue;
+                }
+
+                $timeTable[$date][$employer['name']] = TimeTableRule2023::WORKING_ON_THE_MORNING;
+            }
+
+            $startDate->addDay();
+        }
+    }
+
+    private function addAllMinimumAfternoons(array $employers, array &$timeTable): void
+    {
+        [$startDate, $endDate] = $this->getDateInterval();
+
+        while ($startDate <= $endDate) {
+            foreach ($employers as $employer) {
+                $date = $startDate->format('Y-m-d');
+
+                if (isset($timeTable[$date][$employer['name']])) {
+                    continue;
+                }
+
+                if ($startDate->isWeekend() || in_array($date, TimeTableRule2023::$publicHolidays, true)) {
+                    continue;
+                }
+
+                $noOfAfternoons = array_count_values(
+                    array_values($timeTable[$date])
+                )[TimeTableRule2023::WORKING_ON_THE_AFTERNOON] ?? 0;
+
+                if ($noOfAfternoons >= TimeTableRule2023::MIN_NO_OF_PERSONS_FOR_AFTERNOON_TURN) {
+                    continue;
+                }
+
+                if (
+                    $this->getNumberOfWorkingHoursForSpecificWeek($timeTable, $startDate, $employer['name'])
+                    >= TimeTableRule2023::MAX_NO_OF_WEEKLY_WORKING_HOURS
+                ) {
+                    continue;
+                }
+
+                $timeTable[$date][$employer['name']] = TimeTableRule2023::WORKING_ON_THE_AFTERNOON;
+            }
+
+            $startDate->addDay();
+        }
+    }
+
+    private function addAllMaximumMornings(array $employers, array &$timeTable): void
+    {
+        [$startDate, $endDate] = $this->getDateInterval();
+
+        while ($startDate <= $endDate) {
+            foreach ($employers as $employer) {
+                $date = $startDate->format('Y-m-d');
+
+                if (isset($timeTable[$date][$employer['name']])) {
+                    continue;
+                }
+
+                if ($startDate->isWeekend() || in_array($date, TimeTableRule2023::$publicHolidays, true)) {
+                    continue;
+                }
+
+                $noOfMornings = array_count_values(
+                    array_values($timeTable[$date])
+                )[TimeTableRule2023::WORKING_ON_THE_MORNING] ?? 0;
+
+                if ($noOfMornings >= TimeTableRule2023::MAX_NO_OF_PERSONS_FOR_MORNING_TURN) {
+                    continue;
+                }
+
+                if (
+                    $this->getNumberOfWorkingHoursForSpecificWeek($timeTable, $startDate, $employer['name'])
+                    >= TimeTableRule2023::MAX_NO_OF_WEEKLY_WORKING_HOURS
+                ) {
+                    continue;
+                }
+
+                $timeTable[$date][$employer['name']] = TimeTableRule2023::WORKING_ON_THE_MORNING;
+            }
+
+            $startDate->addDay();
+        }
+    }
+
+    private function addAllMaximumAfternoons(array $employers, array &$timeTable): void
+    {
+        [$startDate, $endDate] = $this->getDateInterval();
+
+        while ($startDate <= $endDate) {
+            foreach ($employers as $employer) {
+                $date = $startDate->format('Y-m-d');
+
+                if (isset($timeTable[$date][$employer['name']])) {
+                    continue;
+                }
+
+                if ($startDate->isWeekend() || in_array($date, TimeTableRule2023::$publicHolidays, true)) {
+                    continue;
+                }
+
+                $noOfAfternoons = array_count_values(
+                    array_values($timeTable[$date])
+                )[TimeTableRule2023::WORKING_ON_THE_AFTERNOON] ?? 0;
+
+                if ($noOfAfternoons >= TimeTableRule2023::MAX_NO_OF_PERSONS_FOR_AFTERNOON_TURN) {
+                    continue;
+                }
+
+                if (
+                    $this->getNumberOfWorkingHoursForSpecificWeek($timeTable, $startDate, $employer['name'])
+                    >= TimeTableRule2023::MAX_NO_OF_WEEKLY_WORKING_HOURS
+                ) {
+                    continue;
+                }
+
+                $timeTable[$date][$employer['name']] = TimeTableRule2023::WORKING_ON_THE_AFTERNOON;
+            }
+
+            $startDate->addDay();
+        }
+    }
+
+    /**
+     * @throws Exception
+     */
+    public function saveTimeTable(array $employers, array $timeTable)
+    {
+        $spreadsheet = new Spreadsheet();
+        $sheet = $spreadsheet->getActiveSheet();
+        $employers = $this->getOrderedEmployers($employers);
+
+        foreach ($employers as $key => $employer) {
+            $sheet->setCellValue('A' . ($key + 2), $employer['name']);
+        }
+
+        $index = 1;
+
+        foreach ($timeTable as $date => $employersTable) {
+            [, $month, $day] = explode('-', $date, 3) + ['', '', ''];
+            $column = TimeTableHelper::mapColumnTimeTable()[$index];
+            $sheet->setCellValue($column . '1', $day . '/' . $month);
+
+            foreach ($employersTable as $name => $option) {
+                if (
+                    in_array(
+                        $option,
+                        [TimeTableRule2023::FREE_DAY_AFTER_NIGHT_TURN, TimeTableRule2023::FREE_NATIONAL_DAY],
+                        true
+                    )
+                ) {
+                    continue;
+                }
+
+                if (
+                    in_array($date, TimeTableRule2023::$publicHolidays, true)
+                    && $option === TimeTableRule2023::FREE_DAY
+                ) {
+                    continue;
+                }
+
+                $employerIndex = array_values(
+                    array_filter($employers, fn (array $employer) => $name === $employer['name'])
+                )[0]['order_index'];
+                $sheet->setCellValue($column . ($employerIndex + 2), $option);
+            }
+
+            $index++;
+        }
+
+        $writer = new Xlsx($spreadsheet);
+        $writer->save($this->getOutputFilePath());
+    }
+
+    private function getOrderedEmployers(array $employers): array
+    {
+        usort(
+            $employers,
+            fn (array $firstEmployer, array $secondEmployer)
+                => $firstEmployer['order_index'] <=> $secondEmployer['order_index']
+        );
+
+        return $employers;
     }
 }
