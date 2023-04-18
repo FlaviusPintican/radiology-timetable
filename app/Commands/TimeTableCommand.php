@@ -12,6 +12,8 @@ use InvalidArgumentException;
 use LaravelZero\Framework\Commands\Command;
 use PhpOffice\PhpSpreadsheet\IOFactory;
 use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Style\Color;
+use PhpOffice\PhpSpreadsheet\Style\Fill;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 use Throwable;
 
@@ -1322,6 +1324,7 @@ class TimeTableCommand extends Command
         $spreadsheet = new Spreadsheet();
         $sheet = $spreadsheet->getActiveSheet();
         $employers = $this->getOrderedEmployers($employers);
+        $noOfEmployers = count($employers) + 1;
 
         foreach ($employers as $key => $employer) {
             $sheet->setCellValue('A' . ($key + 2), $employer['name']);
@@ -1333,6 +1336,16 @@ class TimeTableCommand extends Command
             [, $month, $day] = explode('-', $date, 3) + ['', '', ''];
             $column = TimeTableHelper::mapColumnTimeTable()[$index];
             $sheet->setCellValue($column . '1', $day . '/' . $month);
+
+            if (Carbon::parse($date)->isWeekend()) {
+                $spreadsheet
+                    ->getActiveSheet()
+                    ->getStyle($column . '1:' . $column . $noOfEmployers)
+                    ->getFill()
+                    ->setFillType(Fill::FILL_SOLID)
+                    ->getStartColor()
+                    ->setARGB(Color::COLOR_YELLOW);
+            }
 
             foreach ($employersTable as $name => $option) {
                 if (
